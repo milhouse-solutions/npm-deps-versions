@@ -1,0 +1,86 @@
+{
+  "name": "npm-deps-versions",
+  "displayName": "NPM Deps Versions",
+  "description": "This extension adds lense to package.json files dependencies and devDependencies section. For each dependecy, it will display the dependencyies current version from registry.npmjs.org",
+  "version": "0.0.1",
+  "icon": "icon.png",
+  "publisher": "milhouse.solutions",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/package.json"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "title": "Enable CodeLens",
+        "command": "npm-deps-versions.enableCodeLens",
+        "category": "NPM Deps Versions"
+      },
+      {
+        "title": "Disable Codelens",
+        "command": "npm-deps-versions.disableCodeLens",
+        "category": "NPM Deps Versions"
+      }
+    ],
+    "configuration": {
+      "properties": {
+        "npm-deps-versions.enableCodeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show CodeLens for available dependency upgrades.",
+          "order": 1
+        },
+        "npm-deps-versions.enableReleaseCandidateUpgrades": {
+          "type": "boolean",
+          "default": false,
+          "description": "Search for release candidate versions.",
+          "order": 2
+        },
+        "npm-deps-versions.enableBetaUpgrades": {
+          "type": "boolean",
+          "default": false,
+          "description": "Search for beta versions.",
+          "order": 3
+        },
+        "npm-deps-versions.enableAlphaUpgrades": {
+          "type": "boolean",
+          "default": false,
+          "description": "Search for alpha versions.",
+          "order": 4
+        },
+        "npm-deps-versions.enableDevUpgrades": {
+          "type": "boolean",
+          "default": false,
+          "description": "Search for developer versions.",
+          "order": 5
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "18.x",
+    "@types/vscode": "^1.88.0",
+    "@typescript-eslint/eslint-plugin": "^7.4.0",
+    "@typescript-eslint/parser": "^7.4.0",
+    "@vscode/test-cli": "^0.0.8",
+    "@vscode/test-electron": "^2.3.9",
+    "eslint": "^8.57.0",
+    "typescript": "^5.3.3"
+  }
+}
