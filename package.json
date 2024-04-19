@@ -4,7 +4,7 @@
   "description": "This extension adds lense to package.json files dependencies and devDependencies section. For each dependecy, it will display the dependencyies current version from registry.npmjs.org",
   "version": "0.0.1",
   "icon": "icon.png",
-  "publisher": "milhouse.solutions",
+  "publisher": "milhouse-solutions",
   "license": "MIT",
   "engines": {
     "vscode": "^1.88.0"
@@ -80,6 +80,7 @@
     "@typescript-eslint/parser": "^7.4.0",
     "@vscode/test-cli": "^0.0.8",
     "@vscode/test-electron": "^2.3.9",
+    "@vscode/vsce": "^2.26.0",
     "eslint": "^8.57.0",
     "typescript": "^5.3.3"
   }
