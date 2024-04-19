@@ -30,11 +30,24 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       });
 
       for (const [name, currentVersion] of allDependencies) {
+        if (!name || !currentVersion) {
+          continue;
+        }
+
         const cleanCurrentVersion = currentVersion.replace(/\^|~/, "");
         const npmVersions = await this.fetchNpmVersions(
           name,
           cleanCurrentVersion
         );
+
+        if (
+          !npmVersions.latestMajor ||
+          !npmVersions.latestMinor ||
+          !npmVersions.latestPatch
+        ) {
+          continue;
+        }
+
         const line = document
           .getText()
           .split("\n")
@@ -104,6 +117,9 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       .map(Number);
 
     const response = await fetch(`https://registry.npmjs.org/${packageName}`);
+
+    if (!response.ok) return {};
+
     const data = (await response.json()) as {
       "dist-tags": { latest: string };
       versions: { [key: string]: any };
