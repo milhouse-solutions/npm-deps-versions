@@ -5,6 +5,7 @@
   "version": "0.0.1",
   "icon": "icon.png",
   "publisher": "milhouse-solutions",
+  "repository": "https://github.com/milhouse-solutions/npm-deps-versions",
   "license": "MIT",
   "engines": {
     "vscode": "^1.88.0"
