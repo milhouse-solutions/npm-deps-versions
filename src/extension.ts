@@ -9,12 +9,15 @@ import {
 import { CodelensProvider } from "./CodelensProvider";
 
 let disposables: Disposable[] = [];
+let codelensProvider: CodelensProvider;
 
 export function activate(_context: ExtensionContext) {
+  codelensProvider = new CodelensProvider();
+
   disposables.push(
     languages.registerCodeLensProvider(
       { pattern: "**/package.json" },
-      new CodelensProvider()
+      codelensProvider
     ),
     commands.registerCommand("npm-deps-versions.enableCodeLens", () => {
       workspace
@@ -35,7 +38,26 @@ export function activate(_context: ExtensionContext) {
         const terminal = window.activeTerminal || window.createTerminal();
         terminal.sendText(`npm install ${args.pkg}@${args.newVersion}`);
       }
-    )
+    ),
+    commands.registerCommand("npm-deps-versions.refreshCache", () => {
+      const editor = window.activeTextEditor;
+      if (editor && editor.document.fileName.endsWith("package.json")) {
+        codelensProvider.invalidateCache(editor.document.uri.toString());
+        window.showInformationMessage(
+          "Cache refreshed. CodeLens will update shortly."
+        );
+      } else {
+        window.showWarningMessage(
+          "Please open a package.json file to refresh the cache."
+        );
+      }
+    }),
+    workspace.onDidChangeTextDocument((event) => {
+      // Invalidate cache when package.json is modified
+      if (event.document.fileName.endsWith("package.json")) {
+        codelensProvider.invalidateCache(event.document.uri.toString());
+      }
+    })
   );
 }
 
