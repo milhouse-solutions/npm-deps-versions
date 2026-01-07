@@ -2,7 +2,7 @@
   "name": "npm-deps-versions",
   "displayName": "NPM Deps Versions",
   "description": "This extension adds lense to package.json files dependencies and devDependencies section. For each dependecy, it will display the dependencyies current version from registry.npmjs.org",
-  "version": "0.0.2",
+  "version": "1.0.0",
   "icon": "icon.png",
   "publisher": "milhouse-solutions",
   "repository": "https://github.com/milhouse-solutions/npm-deps-versions",
