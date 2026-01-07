@@ -2,7 +2,7 @@
   "name": "npm-deps-versions",
   "displayName": "NPM Deps Versions",
   "description": "This extension adds lense to package.json files dependencies and devDependencies section. For each dependecy, it will display the dependencyies current version from registry.npmjs.org",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "icon": "icon.png",
   "publisher": "milhouse-solutions",
   "repository": "https://github.com/milhouse-solutions/npm-deps-versions",
@@ -78,6 +78,9 @@
     "lint": "eslint src --ext ts",
     "test": "vscode-test"
   },
+  "dependencies": {
+    "semver": "^7.7.3"
+  },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "^20.19.27",
@@ -89,7 +92,6 @@
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.7.1",
     "eslint": "^8.57.1",
-    "typescript": "^5.9.3",
-    "semver": "^7.7.3"
+    "typescript": "^5.9.3"
   }
 }
