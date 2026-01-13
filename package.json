@@ -2,7 +2,7 @@
   "name": "npm-deps-versions",
   "displayName": "NPM Deps Versions",
   "description": "This extension adds lense to package.json files dependencies and devDependencies section. For each dependecy, it will display the dependencyies current version from registry.npmjs.org",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "icon": "icon.png",
   "publisher": "milhouse-solutions",
   "repository": "https://github.com/milhouse-solutions/npm-deps-versions",
@@ -66,6 +66,18 @@
           "default": false,
           "description": "Search for developer versions.",
           "order": 5
+        },
+        "npm-deps-versions.versionGetMethod": {
+          "type": "string",
+          "enum": ["cli", "http"],
+          "description": "Method to fetch package versions: 'cli' uses npm CLI, 'http' uses HTTP requests to npm registry. Leave unset to be prompted on first use.",
+          "order": 6
+        },
+        "npm-deps-versions.httpTimeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "Timeout in milliseconds for HTTP requests to npm registry (HTTP mode only). Default is 30000ms (30 seconds) to match npm CLI timeout.",
+          "order": 7
         }
       }
     }

@@ -2,8 +2,8 @@ import * as vscode from "vscode";
 
 export interface VersionInfo {
   latestMajor: string;
-  latestMinor: string;
-  latestPatch: string;
+  latestMinor?: string;
+  latestPatch?: string;
 }
 
 interface CacheEntry {

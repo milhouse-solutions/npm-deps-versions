@@ -5,14 +5,31 @@ import {
   Disposable,
   workspace,
   window,
+  OutputChannel,
 } from "vscode";
+import * as path from "path";
+import * as fs from "fs";
 import { CodelensProvider } from "./CodelensProvider";
+import { ConfigurationDialog } from "./ConfigurationDialog";
 
 let disposables: Disposable[] = [];
 let codelensProvider: CodelensProvider;
+let outputChannel: OutputChannel;
 
-export function activate(_context: ExtensionContext) {
-  codelensProvider = new CodelensProvider();
+export async function activate(context: ExtensionContext) {
+  // Create output channel for logging
+  outputChannel = window.createOutputChannel("NPM Deps Versions");
+  outputChannel.appendLine("NPM Deps Versions extension activated");
+
+  // Check if configuration dialog should be shown
+  const packageJsonPath = path.join(context.extensionPath, "package.json");
+  const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as {
+    version: string;
+  };
+  const currentVersion = packageJson.version;
+  await ConfigurationDialog.checkAndShowDialog(context, currentVersion);
+
+  codelensProvider = new CodelensProvider(outputChannel);
 
   disposables.push(
     languages.registerCodeLensProvider(
@@ -31,11 +48,22 @@ export function activate(_context: ExtensionContext) {
     }),
     commands.registerCommand(
       "npm-deps-versions.codelensAction",
-      (args: { pkg: string; newVersion: string }) => {
+      (args: { pkg: string; newVersion: string; packageJsonPath?: string }) => {
         window.showInformationMessage(
           `Updating ${args.pkg} to version ${args.newVersion}...`
         );
-        const terminal = window.activeTerminal || window.createTerminal();
+
+        let terminal = window.activeTerminal;
+        if (args.packageJsonPath) {
+          // Get directory from package.json path
+          const packageJsonDir = path.dirname(args.packageJsonPath);
+          // Create terminal with cwd in the correct directory for Mono-Repo support
+          terminal = window.createTerminal({ cwd: packageJsonDir });
+        } else {
+          // Fallback to existing behavior
+          terminal = terminal || window.createTerminal();
+        }
+
         terminal.sendText(`npm install ${args.pkg}@${args.newVersion}`);
       }
     ),
@@ -65,6 +93,9 @@ export function activate(_context: ExtensionContext) {
 export function deactivate() {
   if (disposables) {
     disposables.forEach((item) => item.dispose());
+  }
+  if (outputChannel) {
+    outputChannel.dispose();
   }
   disposables = [];
 }
