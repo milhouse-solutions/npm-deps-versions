@@ -80,10 +80,10 @@ export async function activate(context: ExtensionContext) {
         );
       }
     }),
-    workspace.onDidChangeTextDocument((event) => {
-      // Invalidate cache when package.json is modified
-      if (event.document.fileName.endsWith("package.json")) {
-        codelensProvider.invalidateCache(event.document.uri.toString());
+    workspace.onDidSaveTextDocument((document) => {
+      // Invalidate cache when package.json is saved
+      if (document.fileName.endsWith("package.json")) {
+        codelensProvider.invalidateCache(document.uri.toString());
       }
     })
   );
