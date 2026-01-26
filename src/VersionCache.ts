@@ -82,6 +82,29 @@ export class VersionCache {
   }
 
   /**
+   * Invalidates cache for specific dependencies in a document
+   */
+  invalidateDependencies(
+    documentUri: string,
+    packageNames: string[]
+  ): void {
+    const keysToDelete: string[] = [];
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(`${documentUri}@`)) {
+        // Extract package name from cache key (format: documentUri@packageName@version)
+        const parts = key.split("@");
+        if (parts.length >= 2) {
+          const packageName = parts[1];
+          if (packageNames.includes(packageName)) {
+            keysToDelete.push(key);
+          }
+        }
+      }
+    }
+    keysToDelete.forEach((key) => this.cache.delete(key));
+  }
+
+  /**
    * Clears all cache entries
    */
   clear(): void {

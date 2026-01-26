@@ -36,6 +36,7 @@ export class CodelensProvider implements vscode.CodeLensProvider {
   private currentCodeLenses: Map<string, vscode.CodeLens[]> = new Map();
   private loadingDocuments: Map<string, boolean> = new Map();
   private completedLoads: Map<string, boolean> = new Map();
+  private previousDependencies: Map<string, Map<string, string>> = new Map();
 
   constructor(outputChannel?: vscode.OutputChannel) {
     this.outputChannel =
@@ -94,6 +95,16 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       }
     }
 
+    // If document changed but we have completed loads, just update hash and return cached CodeLenses
+    if (documentChanged && this.completedLoads.get(documentUri)) {
+      this.cancelDocumentRequests(documentUri);
+      this.cache.updateDocumentHash(document);
+      const existingCodeLenses = this.currentCodeLenses.get(documentUri);
+      if (existingCodeLenses) {
+        return existingCodeLenses;
+      }
+    }
+
     // Check for existing in-progress request
     const existingRequest = this.activeRequests.get(documentUri);
     if (existingRequest && !documentChanged) {
@@ -104,10 +115,9 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       }
     }
 
-    // Only cancel existing requests if document actually changed
+    // Only cancel existing requests if document actually changed (and no completed loads)
     if (documentChanged) {
       this.cancelDocumentRequests(documentUri);
-      this.cache.invalidateDocument(documentUri);
       this.cache.updateDocumentHash(document);
     }
 
@@ -200,10 +210,39 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     return -1;
   }
 
+  /**
+   * Compares current dependencies with previous state and returns changed dependencies
+   */
+  private getChangedDependencies(
+    documentUri: string,
+    currentDeps: DependencyInfo[]
+  ): DependencyInfo[] {
+    const previous = this.previousDependencies.get(documentUri);
+    
+    // If no previous state exists, all dependencies are considered "new"
+    if (!previous) {
+      return currentDeps;
+    }
+
+    const changed: DependencyInfo[] = [];
+
+    for (const currentDep of currentDeps) {
+      const previousVersion = previous.get(currentDep.name);
+      
+      // New dependency or version changed
+      if (!previousVersion || previousVersion !== currentDep.cleanVersion) {
+        changed.push(currentDep);
+      }
+    }
+
+    return changed;
+  }
+
   private async loadVersionsAsync(
     document: vscode.TextDocument,
     dependencies: DependencyInfo[],
-    token: vscode.CancellationToken
+    token: vscode.CancellationToken,
+    isPartialUpdate: boolean = false
   ): Promise<void> {
     const documentUri = document.uri.toString();
     const config = vscode.workspace.getConfiguration("npm-deps-versions");
@@ -363,6 +402,30 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       // Mark load as completed and no longer loading
       this.completedLoads.set(documentUri, true);
       this.loadingDocuments.set(documentUri, false);
+
+      // Fire final update event now that loading is complete
+      // Update previous dependencies state after successful load
+      if (!isPartialUpdate) {
+        // Full load - update all dependencies
+        const currentState = new Map<string, string>();
+        for (const dep of dependencies) {
+          currentState.set(dep.name, dep.cleanVersion);
+        }
+        this.previousDependencies.set(documentUri, currentState);
+        this.log(
+          `[npm-deps-versions:loadVersionsAsync] Updated previousDependencies state for ${dependencies.length} dependencies`
+        );
+      } else {
+        // Partial update - merge changed dependencies into existing state
+        const existingState = this.previousDependencies.get(documentUri) || new Map<string, string>();
+        for (const dep of dependencies) {
+          existingState.set(dep.name, dep.cleanVersion);
+        }
+        this.previousDependencies.set(documentUri, existingState);
+        this.log(
+          `[npm-deps-versions:loadVersionsAsync] Updated previousDependencies state for ${dependencies.length} changed dependencies`
+        );
+      }
 
       // Fire final update event now that loading is complete
       this.log(
@@ -809,12 +872,218 @@ export class CodelensProvider implements vscode.CodeLensProvider {
 
   /**
    * Invalidates cache for a specific document (used by refresh command)
+   * Optionally invalidates only specific packages
    */
-  invalidateCache(documentUri: string): void {
-    this.cache.invalidateDocument(documentUri);
-    // Clear completion state so next provideCodeLenses will reload
-    this.completedLoads.delete(documentUri);
-    this.loadingDocuments.delete(documentUri);
+  invalidateCache(documentUri: string, packageNames?: string[]): void {
+    if (packageNames && packageNames.length > 0) {
+      this.cache.invalidateDependencies(documentUri, packageNames);
+    } else {
+      this.cache.invalidateDocument(documentUri);
+      // Clear completion state so next provideCodeLenses will reload
+      this.completedLoads.delete(documentUri);
+      this.loadingDocuments.delete(documentUri);
+      // Clear previous dependencies state for full invalidation
+      this.previousDependencies.delete(documentUri);
+    }
     this._onDidChangeCodeLenses.fire();
+  }
+
+  /**
+   * Handles save event: compares current dependencies with previous state
+   * and invalidates cache only for changed dependencies
+   */
+  handleDocumentSave(document: vscode.TextDocument): void {
+    const documentUri = document.uri.toString();
+
+    // Parse package.json to extract current dependencies
+    let packageJson: any;
+    try {
+      packageJson = JSON.parse(document.getText());
+    } catch (error) {
+      // Invalid JSON - invalidate all as fallback
+      this.invalidateCache(documentUri);
+      return;
+    }
+
+    const currentDependencies = this.extractDependencies(packageJson, document);
+    const changedDeps = this.getChangedDependencies(documentUri, currentDependencies);
+
+    if (changedDeps.length === 0) {
+      // No changes, nothing to do
+      this.log(
+        `[npm-deps-versions:handleDocumentSave] No dependency changes detected`
+      );
+      return;
+    }
+
+    this.log(
+      `[npm-deps-versions:handleDocumentSave] Found ${changedDeps.length} changed dependencies: ${changedDeps.map(d => d.name).join(", ")}`
+    );
+
+    this.invalidateChangedDependencies(document, changedDeps);
+  }
+
+  /**
+   * Invalidates cache and updates CodeLenses only for changed dependencies
+   */
+  private invalidateChangedDependencies(
+    document: vscode.TextDocument,
+    changedDeps: DependencyInfo[]
+  ): void {
+    const documentUri = document.uri.toString();
+    
+    if (changedDeps.length === 0) {
+      return;
+    }
+
+    const packageNames = changedDeps.map((dep) => dep.name);
+    
+    // Invalidate cache for changed dependencies
+    this.cache.invalidateDependencies(documentUri, packageNames);
+
+    // Get current CodeLenses
+    const existingCodeLenses = this.currentCodeLenses.get(documentUri);
+    if (!existingCodeLenses) {
+      // No existing CodeLenses, trigger full reload
+      this.completedLoads.delete(documentUri);
+      this._onDidChangeCodeLenses.fire();
+      return;
+    }
+
+    // Parse package.json to get all dependencies to find correct indices
+    let packageJson: any;
+    try {
+      packageJson = JSON.parse(document.getText());
+    } catch (error) {
+      return;
+    }
+
+    const allDependencies = this.extractDependencies(packageJson, document);
+    
+    // Create a map of dependency name to CodeLens index for quick lookup
+    const depIndexMap = new Map<string, number>();
+    allDependencies.forEach((dep, index) => {
+      depIndexMap.set(dep.name, index);
+    });
+
+    // Create array of changed dependencies with their correct CodeLens indices
+    const changedDepsWithIndices: Array<{ dep: DependencyInfo; index: number }> = [];
+    for (const changedDep of changedDeps) {
+      const codeLensIndex = depIndexMap.get(changedDep.name);
+      if (codeLensIndex !== undefined && existingCodeLenses[codeLensIndex]) {
+        // Update to loading state
+        existingCodeLenses[codeLensIndex] = new vscode.CodeLens(
+          new vscode.Range(changedDep.line, 0, changedDep.line, 0),
+          {
+            command: "",
+            title: "Loading version...",
+            arguments: [],
+          }
+        );
+        changedDepsWithIndices.push({ dep: changedDep, index: codeLensIndex });
+      }
+    }
+
+    if (changedDepsWithIndices.length === 0) {
+      return;
+    }
+
+    // Trigger async loading for changed dependencies only
+    // Use a cancellation token that won't cancel immediately
+    const token = new vscode.CancellationTokenSource().token;
+    this.loadVersionsAsyncPartial(document, changedDepsWithIndices, token).catch((error) => {
+      this.log(`Error loading changed versions: ${error}`);
+    });
+
+    this._onDidChangeCodeLenses.fire();
+  }
+
+  /**
+   * Loads versions for a subset of dependencies (used for partial updates on save)
+   */
+  private async loadVersionsAsyncPartial(
+    document: vscode.TextDocument,
+    dependenciesWithIndices: Array<{ dep: DependencyInfo; index: number }>,
+    token: vscode.CancellationToken
+  ): Promise<void> {
+    const documentUri = document.uri.toString();
+    const config = vscode.workspace.getConfiguration("npm-deps-versions");
+    const versionGetMethod = config.get<string | undefined>("versionGetMethod");
+    const useNpmCli = versionGetMethod === "cli";
+    const packageJsonPath = document.uri.fsPath;
+    const packageJsonDir = packageJsonPath
+      ? path.dirname(packageJsonPath)
+      : undefined;
+
+    this.log(
+      `[npm-deps-versions:loadVersionsAsyncPartial] Starting for ${
+        dependenciesWithIndices.length
+      } changed dependencies`
+    );
+
+    try {
+      let outdatedPackages: Set<string> | undefined;
+      let npmCliAvailable = useNpmCli && packageJsonDir;
+
+      // If using npm CLI, first get outdated packages
+      if (npmCliAvailable) {
+        try {
+          const dependencyNames = dependenciesWithIndices.map((item) => item.dep.name);
+          outdatedPackages = await this.npmCliService.getOutdatedPackages(
+            packageJsonPath,
+            dependencyNames
+          );
+        } catch (error) {
+          npmCliAvailable = false;
+          outdatedPackages = undefined;
+        }
+      }
+
+      // Load versions in parallel
+      const versionPromises = dependenciesWithIndices.map(({ dep, index }) => {
+        // If using npm CLI and package is not outdated, skip it
+        if (
+          npmCliAvailable &&
+          outdatedPackages &&
+          !outdatedPackages.has(dep.name)
+        ) {
+          this.updateCodeLens(document, dep, index, {
+            latestMajor: dep.cleanVersion,
+            latestMinor: undefined,
+            latestPatch: undefined,
+          });
+          return Promise.resolve();
+        }
+
+        const abortController = new AbortController();
+        return this.loadVersionForDependency(
+          document,
+          dep,
+          index,
+          abortController.signal,
+          !!npmCliAvailable,
+          packageJsonPath,
+          packageJsonDir
+        );
+      });
+
+      await Promise.allSettled(versionPromises);
+
+      // Update previous dependencies state with changed dependencies
+      const existingState = this.previousDependencies.get(documentUri) || new Map<string, string>();
+      for (const { dep } of dependenciesWithIndices) {
+        existingState.set(dep.name, dep.cleanVersion);
+      }
+      this.previousDependencies.set(documentUri, existingState);
+      this.log(
+        `[npm-deps-versions:loadVersionsAsyncPartial] Updated previousDependencies state for ${dependenciesWithIndices.length} changed dependencies`
+      );
+
+      this._onDidChangeCodeLenses.fire();
+    } catch (error) {
+      this.log(
+        `[npm-deps-versions:loadVersionsAsyncPartial] Error: ${error}`
+      );
+    }
   }
 }

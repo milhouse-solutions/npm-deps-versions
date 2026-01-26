@@ -81,9 +81,9 @@ export async function activate(context: ExtensionContext) {
       }
     }),
     workspace.onDidSaveTextDocument((document) => {
-      // Invalidate cache when package.json is saved
+      // Handle selective cache invalidation when package.json is saved
       if (document.fileName.endsWith("package.json")) {
-        codelensProvider.invalidateCache(document.uri.toString());
+        codelensProvider.handleDocumentSave(document);
       }
     })
   );
