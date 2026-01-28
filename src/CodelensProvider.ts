@@ -4,6 +4,10 @@ import semver from "semver";
 import { VersionCache, VersionInfo } from "./VersionCache";
 import { HttpService } from "./HttpService";
 import { NpmCliService } from "./NpmCliService";
+import { PythonCliService } from "./PythonCliService";
+import { PythonHttpService } from "./PythonHttpService";
+import { PyprojectParser } from "./PyprojectParser";
+import { gtPep440, gtePep440, getVersionParts } from "./Pep440Parser";
 
 interface DependencyInfo {
   name: string;
@@ -26,6 +30,8 @@ export class CodelensProvider implements vscode.CodeLensProvider {
   private readonly cache: VersionCache;
   private readonly httpService: HttpService;
   private readonly npmCliService: NpmCliService;
+  private readonly pythonCliService: PythonCliService;
+  private readonly pythonHttpService: PythonHttpService;
   private readonly outputChannel: vscode.OutputChannel;
   private readonly activeRequests: Map<
     string,
@@ -40,10 +46,12 @@ export class CodelensProvider implements vscode.CodeLensProvider {
 
   constructor(outputChannel?: vscode.OutputChannel) {
     this.outputChannel =
-      outputChannel || vscode.window.createOutputChannel("NPM Deps Versions");
+      outputChannel || vscode.window.createOutputChannel("Deps Versions");
     this.cache = new VersionCache();
     this.httpService = new HttpService();
     this.npmCliService = new NpmCliService(this.outputChannel);
+    this.pythonCliService = new PythonCliService(this.outputChannel);
+    this.pythonHttpService = new PythonHttpService();
 
     vscode.workspace.onDidChangeConfiguration(() => {
       this._onDidChangeCodeLenses.fire();
@@ -65,10 +73,19 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     document: vscode.TextDocument,
     token: vscode.CancellationToken
   ): Promise<vscode.CodeLens[]> {
-    // Check if CodeLens is enabled
+    // Detect file type
+    const isPython = document.fileName.endsWith("pyproject.toml");
+    const isNpm = document.fileName.endsWith("package.json");
+    
+    if (!isPython && !isNpm) {
+      return [];
+    }
+
+    // Check if CodeLens is enabled for this ecosystem
+    const configNamespace = isPython ? "deps-versions.python" : "deps-versions.npm";
     if (
       !vscode.workspace
-        .getConfiguration("npm-deps-versions")
+        .getConfiguration(configNamespace)
         .get("enableCodeLens", true)
     ) {
       return [];
@@ -121,16 +138,22 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       this.cache.updateDocumentHash(document);
     }
 
-    // Parse package.json with error handling
-    let packageJson: any;
-    try {
-      packageJson = JSON.parse(document.getText());
-    } catch (error) {
-      // Invalid JSON - return empty array
-      return [];
+    // Parse file based on type
+    let allDependencies: DependencyInfo[];
+    if (isPython) {
+      // Parse pyproject.toml
+      allDependencies = PyprojectParser.extractDependencies(document);
+    } else {
+      // Parse package.json
+      let packageJson: any;
+      try {
+        packageJson = JSON.parse(document.getText());
+      } catch (error) {
+        // Invalid JSON - return empty array
+        return [];
+      }
+      allDependencies = this.extractDependencies(packageJson, document);
     }
-
-    const allDependencies = this.extractDependencies(packageJson, document);
     const codeLenses: vscode.CodeLens[] = [];
 
     // Create initial CodeLenses with "Loading..." state
@@ -150,7 +173,7 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     this.currentCodeLenses.set(documentUri, codeLenses);
 
     // Start async loading of versions
-    this.loadVersionsAsync(document, allDependencies, token).catch((error) => {
+    this.loadVersionsAsync(document, allDependencies, token, isPython).catch((error) => {
       // Log error but don't show to user unless critical
       this.log(`Error loading versions: ${error}`);
     });
@@ -242,24 +265,24 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     document: vscode.TextDocument,
     dependencies: DependencyInfo[],
     token: vscode.CancellationToken,
+    isPython: boolean = false,
     isPartialUpdate: boolean = false
   ): Promise<void> {
     const documentUri = document.uri.toString();
-    const config = vscode.workspace.getConfiguration("npm-deps-versions");
+    const configNamespace = isPython ? "deps-versions.python" : "deps-versions.npm";
+    const config = vscode.workspace.getConfiguration(configNamespace);
     const versionGetMethod = config.get<string | undefined>("versionGetMethod");
-    const useNpmCli = versionGetMethod === "cli";
-    const packageJsonPath = document.uri.fsPath;
-    const packageJsonDir = packageJsonPath
-      ? path.dirname(packageJsonPath)
-      : undefined;
+    const useCli = versionGetMethod === "cli";
+    const filePath = document.uri.fsPath;
+    const fileDir = filePath ? path.dirname(filePath) : undefined;
 
     this.log(
       `[npm-deps-versions:loadVersionsAsync] Starting for ${
         dependencies.length
       } dependencies, method: ${
         versionGetMethod || "not set"
-      }, useNpmCli: ${useNpmCli}, packageJsonPath: ${packageJsonPath}, packageJsonDir: ${
-        packageJsonDir || "undefined"
+      }, useCli: ${useCli}, filePath: ${filePath}, fileDir: ${
+        fileDir || "undefined"
       }`
     );
 
@@ -296,103 +319,113 @@ export class CodelensProvider implements vscode.CodeLensProvider {
 
     try {
       let outdatedPackages: Set<string> | undefined;
-      let npmCliAvailable = useNpmCli && packageJsonDir;
+      let cliAvailable = useCli && fileDir;
 
-      // If using npm CLI, first get outdated packages
-      if (npmCliAvailable) {
+      // If using CLI, first get outdated packages
+      if (cliAvailable) {
         try {
           this.log(
-            `[npm-deps-versions:loadVersionsAsync] Calling getOutdatedPackages for ${dependencies.length} packages`
+            `[deps-versions:loadVersionsAsync] Calling getOutdatedPackages for ${dependencies.length} packages (${isPython ? "Python" : "npm"})`
           );
           const dependencyNames = dependencies.map((dep) => dep.name);
-          outdatedPackages = await this.npmCliService.getOutdatedPackages(
-            packageJsonPath,
-            dependencyNames
-          );
+          if (isPython) {
+            outdatedPackages = await this.pythonCliService.getOutdatedPackages(
+              filePath,
+              dependencyNames,
+              config
+            );
+          } else {
+            outdatedPackages = await this.npmCliService.getOutdatedPackages(
+              filePath,
+              dependencyNames
+            );
+          }
           this.log(
-            `[npm-deps-versions:loadVersionsAsync] getOutdatedPackages completed, found ${
+            `[deps-versions:loadVersionsAsync] getOutdatedPackages completed, found ${
               outdatedPackages.size
             } outdated packages: ${Array.from(outdatedPackages).join(", ")}`
           );
         } catch (error) {
-          // If npm CLI fails, disable it for this session and fall back to HTTP
+          // If CLI fails, disable it for this session and fall back to HTTP
           this.log(
-            `[npm-deps-versions:loadVersionsAsync] npm CLI getOutdatedPackages failed, disabling npm CLI and falling back to HTTP for all packages: ${error}`
+            `[deps-versions:loadVersionsAsync] CLI getOutdatedPackages failed, disabling CLI and falling back to HTTP for all packages: ${error}`
           );
-          npmCliAvailable = false;
+          cliAvailable = false;
           outdatedPackages = undefined;
         }
       } else {
         this.log(
-          `[npm-deps-versions:loadVersionsAsync] Skipping getOutdatedPackages (useNpmCli: ${useNpmCli}, packageJsonDir: ${
-            packageJsonDir || "undefined"
+          `[deps-versions:loadVersionsAsync] Skipping getOutdatedPackages (useCli: ${useCli}, fileDir: ${
+            fileDir || "undefined"
           })`
         );
       }
 
       // Load all versions in parallel (via queue)
       this.log(
-        `[npm-deps-versions:loadVersionsAsync] Creating ${dependencies.length} version promises, npmCliAvailable: ${npmCliAvailable}`
+        `[deps-versions:loadVersionsAsync] Creating ${dependencies.length} version promises, cliAvailable: ${cliAvailable}`
       );
       const versionPromises = dependencies.map((dep, index) => {
-        // If using npm CLI and package is not outdated, skip it
+        // If using CLI and package is not outdated, skip it
         if (
-          npmCliAvailable &&
+          cliAvailable &&
           outdatedPackages &&
           !outdatedPackages.has(dep.name)
         ) {
           this.log(
-            `[npm-deps-versions:loadVersionsAsync] Package ${dep.name} is up to date, skipping version fetch`
+            `[deps-versions:loadVersionsAsync] Package ${dep.name} is up to date, skipping version fetch`
           );
           // Package is up to date, show "Up to date" immediately
           this.updateCodeLens(document, dep, index, {
             latestMajor: dep.cleanVersion,
             latestMinor: undefined,
             latestPatch: undefined,
-          });
+          }, isPython, filePath);
           return Promise.resolve();
         }
 
         this.log(
-          `[npm-deps-versions:loadVersionsAsync] Starting loadVersionForDependency for ${dep.name} (index ${index}), npmCliAvailable: ${npmCliAvailable}`
+          `[deps-versions:loadVersionsAsync] Starting loadVersionForDependency for ${dep.name} (index ${index}), cliAvailable: ${cliAvailable}`
         );
         return this.loadVersionForDependency(
           document,
           dep,
           index,
           abortController.signal,
-          !!npmCliAvailable,
-          packageJsonPath,
-          packageJsonDir
+          !!cliAvailable,
+          filePath,
+          fileDir,
+          isPython,
+          config
         ).then(
           () => {
             this.log(
-              `[npm-deps-versions:loadVersionsAsync] Completed loadVersionForDependency for ${dep.name} (index ${index})`
+              `[deps-versions:loadVersionsAsync] Completed loadVersionForDependency for ${dep.name} (index ${index})`
             );
           },
           (error) => {
             this.log(
-              `[npm-deps-versions:loadVersionsAsync] Failed loadVersionForDependency for ${dep.name} (index ${index}): ${error}`
+              `[deps-versions:loadVersionsAsync] Failed loadVersionForDependency for ${dep.name} (index ${index}): ${error}`
             );
           }
         );
       });
 
       this.log(
-        `[npm-deps-versions:loadVersionsAsync] Waiting for all version promises to settle`
+        `[deps-versions:loadVersionsAsync] Waiting for all version promises to settle`
       );
       await Promise.allSettled(versionPromises);
       this.log(
-        `[npm-deps-versions:loadVersionsAsync] All version promises settled`
+        `[deps-versions:loadVersionsAsync] All version promises settled`
       );
     } catch (error) {
       this.log(
-        `[npm-deps-versions:loadVersionsAsync] Error in loadVersionsAsync: ${error}`
+        `[deps-versions:loadVersionsAsync] Error in loadVersionsAsync: ${error}`
       );
       throw error;
     } finally {
       this.log(
-        `[npm-deps-versions:loadVersionsAsync] Finally block: cleaning up`
+        `[deps-versions:loadVersionsAsync] Finally block: cleaning up`
       );
       if (cancellationListener) {
         cancellationListener.dispose();
@@ -413,7 +446,7 @@ export class CodelensProvider implements vscode.CodeLensProvider {
         }
         this.previousDependencies.set(documentUri, currentState);
         this.log(
-          `[npm-deps-versions:loadVersionsAsync] Updated previousDependencies state for ${dependencies.length} dependencies`
+          `[deps-versions:loadVersionsAsync] Updated previousDependencies state for ${dependencies.length} dependencies`
         );
       } else {
         // Partial update - merge changed dependencies into existing state
@@ -423,17 +456,17 @@ export class CodelensProvider implements vscode.CodeLensProvider {
         }
         this.previousDependencies.set(documentUri, existingState);
         this.log(
-          `[npm-deps-versions:loadVersionsAsync] Updated previousDependencies state for ${dependencies.length} changed dependencies`
+          `[deps-versions:loadVersionsAsync] Updated previousDependencies state for ${dependencies.length} changed dependencies`
         );
       }
 
       // Fire final update event now that loading is complete
       this.log(
-        `[npm-deps-versions:loadVersionsAsync] Load complete, firing final onDidChangeCodeLenses event`
+        `[deps-versions:loadVersionsAsync] Load complete, firing final onDidChangeCodeLenses event`
       );
       this._onDidChangeCodeLenses.fire();
 
-      this.log(`[npm-deps-versions:loadVersionsAsync] Cleanup complete`);
+      this.log(`[deps-versions:loadVersionsAsync] Cleanup complete`);
     }
   }
 
@@ -442,63 +475,70 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     dependency: DependencyInfo,
     codeLensIndex: number,
     signal: AbortSignal,
-    useNpmCli: boolean,
-    packageJsonPath?: string,
-    packageJsonDir?: string
+    useCli: boolean,
+    filePath?: string,
+    fileDir?: string,
+    isPython: boolean = false,
+    config?: vscode.WorkspaceConfiguration
   ): Promise<void> {
     const documentUri = document.uri.toString();
-    const config = vscode.workspace.getConfiguration("npm-deps-versions");
+    const configNamespace = isPython ? "deps-versions.python" : "deps-versions.npm";
+    const ecosystemConfig = config || vscode.workspace.getConfiguration(configNamespace);
+    const ecosystem = isPython ? "python" : "npm";
+    const cacheKey = `${ecosystem}:${documentUri}@${dependency.name}@${dependency.cleanVersion}`;
 
     this.log(
-      `[npm-deps-versions:loadVersionForDependency] Starting for ${
+      `[deps-versions:loadVersionForDependency] Starting for ${
         dependency.name
       }@${
         dependency.cleanVersion
-      } (index ${codeLensIndex}), useNpmCli: ${useNpmCli}, packageJsonPath: ${
-        packageJsonPath || "undefined"
-      }, packageJsonDir: ${packageJsonDir || "undefined"}`
+      } (index ${codeLensIndex}), ecosystem: ${ecosystem}, useCli: ${useCli}, filePath: ${
+        filePath || "undefined"
+      }, fileDir: ${fileDir || "undefined"}`
     );
 
-    // Check cache first
+    // Check cache first (with ecosystem prefix)
     const cached = this.cache.get(
-      documentUri,
+      `${ecosystem}:${documentUri}`,
       dependency.name,
       dependency.cleanVersion
     );
 
     if (cached) {
       this.log(
-        `[npm-deps-versions:loadVersionForDependency] Found cached version for ${dependency.name}, updating CodeLens`
+        `[deps-versions:loadVersionForDependency] Found cached version for ${dependency.name}, updating CodeLens`
       );
-      this.updateCodeLens(document, dependency, codeLensIndex, cached);
+      this.updateCodeLens(document, dependency, codeLensIndex, cached, isPython, filePath);
       return;
     }
 
     this.log(
-      `[npm-deps-versions:loadVersionForDependency] No cache found for ${dependency.name}, fetching version`
+      `[deps-versions:loadVersionForDependency] No cache found for ${dependency.name}, fetching version`
     );
 
     // Check if aborted
     if (signal.aborted) {
       this.log(
-        `[npm-deps-versions:loadVersionForDependency] Signal already aborted for ${dependency.name}`
+        `[deps-versions:loadVersionForDependency] Signal already aborted for ${dependency.name}`
       );
       // Don't just return - check if we have cached data that we can use
       // This can happen if cache was populated after initial check but before fetch
       const cachedAfterAbort = this.cache.get(
-        documentUri,
+        `${ecosystem}:${documentUri}`,
         dependency.name,
         dependency.cleanVersion
       );
       if (cachedAfterAbort) {
         this.log(
-          `[npm-deps-versions:loadVersionForDependency] Found cached version after abort check for ${dependency.name}, updating CodeLens`
+          `[deps-versions:loadVersionForDependency] Found cached version after abort check for ${dependency.name}, updating CodeLens`
         );
         this.updateCodeLens(
           document,
           dependency,
           codeLensIndex,
-          cachedAfterAbort
+          cachedAfterAbort,
+          isPython,
+          filePath
         );
       }
       return;
@@ -507,38 +547,56 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     try {
       let versionInfo: VersionInfo;
 
-      if (useNpmCli && packageJsonPath && packageJsonDir) {
+      if (useCli && filePath && fileDir) {
         try {
           this.log(
-            `[npm-deps-versions:loadVersionForDependency] Calling npm CLI getPackageVersions for ${dependency.name}`
+            `[deps-versions:loadVersionForDependency] Calling ${ecosystem} CLI getPackageVersions for ${dependency.name}`
           );
-          // Use npm CLI service
-          versionInfo = await this.npmCliService.getPackageVersions(
-            dependency.name,
-            packageJsonPath,
-            dependency.cleanVersion,
-            config
-          );
+          // Use appropriate CLI service
+          if (isPython) {
+            versionInfo = await this.pythonCliService.getPackageVersions(
+              dependency.name,
+              dependency.cleanVersion,
+              filePath,
+              ecosystemConfig
+            );
+          } else {
+            versionInfo = await this.npmCliService.getPackageVersions(
+              dependency.name,
+              filePath,
+              dependency.cleanVersion,
+              ecosystemConfig
+            );
+          }
           this.log(
-            `[npm-deps-versions:loadVersionForDependency] npm CLI getPackageVersions succeeded for ${
+            `[deps-versions:loadVersionForDependency] ${ecosystem} CLI getPackageVersions succeeded for ${
               dependency.name
             }: latestMajor=${versionInfo.latestMajor}, latestMinor=${
               versionInfo.latestMinor || "undefined"
             }, latestPatch=${versionInfo.latestPatch || "undefined"}`
           );
         } catch (error: any) {
-          // Fallback to HTTP if npm CLI fails
+          // Fallback to HTTP if CLI fails
           this.log(
-            `[npm-deps-versions:loadVersionForDependency] npm CLI failed for ${dependency.name}, falling back to HTTP: ${error}`
+            `[deps-versions:loadVersionForDependency] ${ecosystem} CLI failed for ${dependency.name}, falling back to HTTP: ${error}`
           );
-          versionInfo = await this.httpService.fetchNpmVersions(
-            dependency.name,
-            dependency.cleanVersion,
-            config,
-            signal
-          );
+          if (isPython) {
+            versionInfo = await this.pythonHttpService.fetchPyPIVersions(
+              dependency.name,
+              dependency.cleanVersion,
+              ecosystemConfig,
+              signal
+            );
+          } else {
+            versionInfo = await this.httpService.fetchNpmVersions(
+              dependency.name,
+              dependency.cleanVersion,
+              ecosystemConfig,
+              signal
+            );
+          }
           this.log(
-            `[npm-deps-versions:loadVersionForDependency] HTTP fallback succeeded for ${
+            `[deps-versions:loadVersionForDependency] HTTP fallback succeeded for ${
               dependency.name
             }: latestMajor=${versionInfo.latestMajor}, latestMinor=${
               versionInfo.latestMinor || "undefined"
@@ -547,17 +605,26 @@ export class CodelensProvider implements vscode.CodeLensProvider {
         }
       } else {
         this.log(
-          `[npm-deps-versions:loadVersionForDependency] Using HTTP service for ${dependency.name}`
+          `[deps-versions:loadVersionForDependency] Using HTTP service for ${dependency.name}`
         );
         // Use HTTP service
-        versionInfo = await this.httpService.fetchNpmVersions(
-          dependency.name,
-          dependency.cleanVersion,
-          config,
-          signal
-        );
+        if (isPython) {
+          versionInfo = await this.pythonHttpService.fetchPyPIVersions(
+            dependency.name,
+            dependency.cleanVersion,
+            ecosystemConfig,
+            signal
+          );
+        } else {
+          versionInfo = await this.httpService.fetchNpmVersions(
+            dependency.name,
+            dependency.cleanVersion,
+            ecosystemConfig,
+            signal
+          );
+        }
         this.log(
-          `[npm-deps-versions:loadVersionForDependency] HTTP service succeeded for ${
+          `[deps-versions:loadVersionForDependency] HTTP service succeeded for ${
             dependency.name
           }: latestMajor=${versionInfo.latestMajor}, latestMinor=${
             versionInfo.latestMinor || "undefined"
@@ -567,17 +634,17 @@ export class CodelensProvider implements vscode.CodeLensProvider {
 
       if (signal.aborted) {
         this.log(
-          `[npm-deps-versions:loadVersionForDependency] Signal aborted after version fetch for ${dependency.name}`
+          `[deps-versions:loadVersionForDependency] Signal aborted after version fetch for ${dependency.name}`
         );
         return;
       }
 
-      // Store in cache
+      // Store in cache (with ecosystem prefix)
       this.log(
-        `[npm-deps-versions:loadVersionForDependency] Storing version info in cache for ${dependency.name}`
+        `[deps-versions:loadVersionForDependency] Storing version info in cache for ${dependency.name}`
       );
       this.cache.set(
-        documentUri,
+        `${ecosystem}:${documentUri}`,
         dependency.name,
         dependency.cleanVersion,
         versionInfo
@@ -585,25 +652,25 @@ export class CodelensProvider implements vscode.CodeLensProvider {
 
       // Update CodeLens
       this.log(
-        `[npm-deps-versions:loadVersionForDependency] Calling updateCodeLens for ${dependency.name}`
+        `[deps-versions:loadVersionForDependency] Calling updateCodeLens for ${dependency.name}`
       );
-      this.updateCodeLens(document, dependency, codeLensIndex, versionInfo);
+      this.updateCodeLens(document, dependency, codeLensIndex, versionInfo, isPython, filePath);
       this.log(
-        `[npm-deps-versions:loadVersionForDependency] updateCodeLens completed for ${dependency.name}`
+        `[deps-versions:loadVersionForDependency] updateCodeLens completed for ${dependency.name}`
       );
     } catch (error: any) {
       if (signal.aborted) {
         this.log(
-          `[npm-deps-versions:loadVersionForDependency] Signal aborted in error handler for ${dependency.name}`
+          `[deps-versions:loadVersionForDependency] Signal aborted in error handler for ${dependency.name}`
         );
         return;
       }
 
       this.log(
-        `[npm-deps-versions:loadVersionForDependency] Error loading version for ${dependency.name}: ${error}`
+        `[deps-versions:loadVersionForDependency] Error loading version for ${dependency.name}: ${error}`
       );
       this.log(
-        `[npm-deps-versions:loadVersionForDependency] Error message: ${
+        `[deps-versions:loadVersionForDependency] Error message: ${
           error.message || error
         }`
       );
@@ -622,20 +689,60 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     }
   }
 
+  /**
+   * Removes all CodeLenses for a dependency starting from the base index.
+   * Returns the number of CodeLenses that were removed.
+   */
+  private removeCodeLensesForDependency(
+    documentUri: string,
+    baseIndex: number,
+    lineNumber: number
+  ): number {
+    const codeLenses = this.currentCodeLenses.get(documentUri);
+    if (!codeLenses || baseIndex >= codeLenses.length) {
+      return 0;
+    }
+
+    // Count how many consecutive CodeLenses belong to this dependency
+    // (they're all on the same line)
+    let count = 0;
+    for (let i = baseIndex; i < codeLenses.length; i++) {
+      const codeLens = codeLenses[i];
+      if (codeLens && codeLens.range.start.line === lineNumber) {
+        count++;
+      } else {
+        // Stop when we hit a CodeLens on a different line
+        break;
+      }
+    }
+
+    // Remove all CodeLenses for this dependency
+    if (count > 0) {
+      codeLenses.splice(baseIndex, count);
+      this.log(
+        `[deps-versions:removeCodeLensesForDependency] Removed ${count} CodeLens(es) starting at index ${baseIndex}`
+      );
+    }
+
+    return count;
+  }
+
   private updateCodeLens(
     document: vscode.TextDocument,
     dependency: DependencyInfo,
     codeLensIndex: number,
-    versionInfo: VersionInfo
+    versionInfo: VersionInfo,
+    isPython: boolean = false,
+    filePath?: string
   ): void {
-    this.log(
-      `[npm-deps-versions:updateCodeLens] Starting for ${dependency.name} (index ${codeLensIndex})`
-    );
+      this.log(
+        `[deps-versions:updateCodeLens] Starting for ${dependency.name} (index ${codeLensIndex})`
+      );
     const documentUri = document.uri.toString();
     const codeLenses = this.currentCodeLenses.get(documentUri);
     if (!codeLenses || !codeLenses[codeLensIndex]) {
       this.log(
-        `[npm-deps-versions:updateCodeLens] No codeLenses found or invalid index for ${
+        `[deps-versions:updateCodeLens] No codeLenses found or invalid index for ${
           dependency.name
         }, codeLenses exists: ${!!codeLenses}, index valid: ${
           codeLenses ? !!codeLenses[codeLensIndex] : false
@@ -644,27 +751,45 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       return;
     }
 
-    const packageJsonPath = document.uri.fsPath;
+    const filePathToUse = filePath || document.uri.fsPath;
     const commands: vscode.Command[] = this.buildCommands(
       dependency,
       versionInfo,
-      packageJsonPath
+      filePathToUse,
+      isPython
     );
 
     this.log(
-      `[npm-deps-versions:updateCodeLens] Built ${commands.length} commands for ${dependency.name}`
+      `[deps-versions:updateCodeLens] Built ${commands.length} commands for ${dependency.name}`
     );
 
-    // Replace loading CodeLens with actual commands
-    if (commands.length > 0) {
-      codeLenses[codeLensIndex] = new vscode.CodeLens(
-        new vscode.Range(dependency.line, 0, dependency.line, 0),
-        commands[0]
+    // Remove all existing CodeLenses for this dependency before adding new ones
+    // This prevents duplicates when versions are updated
+    const removedCount = this.removeCodeLensesForDependency(
+      documentUri,
+      codeLensIndex,
+      dependency.line
+    );
+    if (removedCount > 0) {
+      this.log(
+        `[deps-versions:updateCodeLens] Removed ${removedCount} existing CodeLens(es) for ${dependency.name}`
       );
+    }
 
-      // Add additional CodeLenses if needed (for multiple upgrade options)
-      for (let i = 1; i < commands.length; i++) {
-        codeLenses.splice(
+    // Get the updated codeLenses array (it may have been modified by removeCodeLensesForDependency)
+    const updatedCodeLenses = this.currentCodeLenses.get(documentUri);
+    if (!updatedCodeLenses) {
+      this.log(
+        `[deps-versions:updateCodeLens] CodeLenses array was removed, cannot update`
+      );
+      return;
+    }
+
+    // Insert new CodeLenses at the same index (after removal, indices shift correctly)
+    if (commands.length > 0) {
+      // Insert all commands starting at codeLensIndex
+      for (let i = 0; i < commands.length; i++) {
+        updatedCodeLenses.splice(
           codeLensIndex + i,
           0,
           new vscode.CodeLens(
@@ -674,30 +799,34 @@ export class CodelensProvider implements vscode.CodeLensProvider {
         );
       }
       this.log(
-        `[npm-deps-versions:updateCodeLens] Updated CodeLens with ${commands.length} upgrade option(s) for ${dependency.name}`
+        `[deps-versions:updateCodeLens] Updated CodeLens with ${commands.length} upgrade option(s) for ${dependency.name}`
       );
     } else {
       // No upgrades available
-      codeLenses[codeLensIndex] = new vscode.CodeLens(
-        new vscode.Range(dependency.line, 0, dependency.line, 0),
-        {
-          command: "",
-          title: "Up to date ✔︎",
-          arguments: [],
-        }
+      updatedCodeLenses.splice(
+        codeLensIndex,
+        0,
+        new vscode.CodeLens(
+          new vscode.Range(dependency.line, 0, dependency.line, 0),
+          {
+            command: "",
+            title: "Up to date ✔︎",
+            arguments: [],
+          }
+        )
       );
       this.log(
-        `[npm-deps-versions:updateCodeLens] Updated CodeLens to "Up to date" for ${dependency.name}`
+        `[deps-versions:updateCodeLens] Updated CodeLens to "Up to date" for ${dependency.name}`
       );
     }
 
     // Debounced update
     this.log(
-      `[npm-deps-versions:updateCodeLens] Calling scheduleCodeLensUpdate for ${dependency.name}`
+      `[deps-versions:updateCodeLens] Calling scheduleCodeLensUpdate for ${dependency.name}`
     );
     this.scheduleCodeLensUpdate(documentUri);
     this.log(
-      `[npm-deps-versions:updateCodeLens] scheduleCodeLensUpdate called for ${dependency.name}`
+      `[deps-versions:updateCodeLens] scheduleCodeLensUpdate called for ${dependency.name}`
     );
   }
 
@@ -721,7 +850,7 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     codeLenses[codeLensIndex] = new vscode.CodeLens(
       new vscode.Range(dependency.line, 0, dependency.line, 0),
       {
-        command: isTimeout ? "npm-deps-versions.refreshCache" : "",
+        command: isTimeout ? "deps-versions.refreshCache" : "",
         title: title,
         tooltip: error.message,
         arguments: [],
@@ -734,7 +863,8 @@ export class CodelensProvider implements vscode.CodeLensProvider {
   private buildCommands(
     dependency: DependencyInfo,
     versionInfo: VersionInfo,
-    packageJsonPath?: string
+    filePath?: string,
+    isPython: boolean = false
   ): vscode.Command[] {
     const commands: vscode.Command[] = [];
 
@@ -742,88 +872,178 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       return commands;
     }
 
-    const current = semver.valid(dependency.cleanVersion);
-    if (!current) {
-      return commands;
-    }
+    if (isPython) {
+      // Use PEP 440 comparison for Python
+      const current = dependency.cleanVersion;
+      const latestMajor = versionInfo.latestMajor;
 
-    const latestMajor = semver.valid(versionInfo.latestMajor);
-    if (!latestMajor) {
-      return commands;
-    }
+      // Check if up to date
+      if (gtePep440(current, latestMajor)) {
+        return commands;
+      }
 
-    // Check if up to date (no upgrades available at all)
-    if (semver.gte(current, latestMajor)) {
-      return commands; // Will show "Up to date" in updateCodeLens
-    }
+      const currentParts = getVersionParts(current);
+      const currentMajor = currentParts.major;
+      const currentMinor = currentParts.minor;
+      const currentPatch = currentParts.patch;
 
-    const currentMajor = semver.major(current);
-    const currentMinor = semver.minor(current);
-    const currentPatch = semver.patch(current);
-
-    // Major upgrade - only if actually greater than current
-    if (
-      semver.gt(latestMajor, current) &&
-      semver.major(latestMajor) > currentMajor
-    ) {
-      commands.push({
-        command: "npm-deps-versions.codelensAction",
-        title: `Major upgrade available: ${versionInfo.latestMajor}`,
-        tooltip: `Upgrades ${dependency.name} from ${dependency.cleanVersion} to ${versionInfo.latestMajor}`,
-        arguments: [
-          {
-            pkg: dependency.name,
-            newVersion: versionInfo.latestMajor,
-            packageJsonPath: packageJsonPath,
-          },
-        ],
-      });
-    }
-
-    // Minor upgrade - only if latestMinor is defined and greater than current
-    if (versionInfo.latestMinor) {
-      const latestMinor = semver.valid(versionInfo.latestMinor);
+      // Major upgrade
+      const latestMajorParts = getVersionParts(latestMajor);
       if (
-        latestMinor &&
-        semver.major(latestMinor) === currentMajor &&
-        semver.minor(latestMinor) > currentMinor
+        gtPep440(latestMajor, current) &&
+        latestMajorParts.major > currentMajor
       ) {
         commands.push({
-          command: "npm-deps-versions.codelensAction",
-          title: `Minor upgrade available: ${versionInfo.latestMinor}`,
-          tooltip: `Upgrades ${dependency.name} from ${dependency.cleanVersion} to ${versionInfo.latestMinor}`,
+          command: "deps-versions.codelensAction",
+          title: `Major upgrade available: ${versionInfo.latestMajor}`,
+          tooltip: `Upgrades ${dependency.name} from ${dependency.cleanVersion} to ${versionInfo.latestMajor}`,
           arguments: [
             {
               pkg: dependency.name,
-              newVersion: versionInfo.latestMinor,
-              packageJsonPath: packageJsonPath,
+              newVersion: versionInfo.latestMajor,
+              filePath: filePath,
+              ecosystem: "python" as const,
             },
           ],
         });
       }
-    }
 
-    // Patch upgrade - only if latestPatch is defined and greater than current
-    if (versionInfo.latestPatch) {
-      const latestPatch = semver.valid(versionInfo.latestPatch);
+      // Minor upgrade
+      if (versionInfo.latestMinor) {
+        const latestMinorParts = getVersionParts(versionInfo.latestMinor);
+        if (
+          gtPep440(versionInfo.latestMinor, current) &&
+          latestMinorParts.major === currentMajor &&
+          latestMinorParts.minor > currentMinor
+        ) {
+          commands.push({
+            command: "deps-versions.codelensAction",
+            title: `Minor upgrade available: ${versionInfo.latestMinor}`,
+            tooltip: `Upgrades ${dependency.name} from ${dependency.cleanVersion} to ${versionInfo.latestMinor}`,
+            arguments: [
+              {
+                pkg: dependency.name,
+                newVersion: versionInfo.latestMinor,
+                filePath: filePath,
+                ecosystem: "python" as const,
+              },
+            ],
+          });
+        }
+      }
+
+      // Patch upgrade
+      if (versionInfo.latestPatch) {
+        const latestPatchParts = getVersionParts(versionInfo.latestPatch);
+        if (
+          gtPep440(versionInfo.latestPatch, current) &&
+          latestPatchParts.major === currentMajor &&
+          latestPatchParts.minor === currentMinor &&
+          latestPatchParts.patch > currentPatch
+        ) {
+          commands.push({
+            command: "deps-versions.codelensAction",
+            title: `Patch upgrade available: ${versionInfo.latestPatch}`,
+            tooltip: `Upgrades ${dependency.name} from ${dependency.cleanVersion} to ${versionInfo.latestPatch}`,
+            arguments: [
+              {
+                pkg: dependency.name,
+                newVersion: versionInfo.latestPatch,
+                filePath: filePath,
+                ecosystem: "python" as const,
+              },
+            ],
+          });
+        }
+      }
+    } else {
+      // Use semver for npm
+      const current = semver.valid(dependency.cleanVersion);
+      if (!current) {
+        return commands;
+      }
+
+      const latestMajor = semver.valid(versionInfo.latestMajor);
+      if (!latestMajor) {
+        return commands;
+      }
+
+      // Check if up to date
+      if (semver.gte(current, latestMajor)) {
+        return commands;
+      }
+
+      const currentMajor = semver.major(current);
+      const currentMinor = semver.minor(current);
+      const currentPatch = semver.patch(current);
+
+      // Major upgrade
       if (
-        latestPatch &&
-        semver.major(latestPatch) === currentMajor &&
-        semver.minor(latestPatch) === currentMinor &&
-        semver.patch(latestPatch) > currentPatch
+        semver.gt(latestMajor, current) &&
+        semver.major(latestMajor) > currentMajor
       ) {
         commands.push({
-          command: "npm-deps-versions.codelensAction",
-          title: `Patch upgrade available: ${versionInfo.latestPatch}`,
-          tooltip: `Upgrades ${dependency.name} from ${dependency.cleanVersion} to ${versionInfo.latestPatch}`,
+          command: "deps-versions.codelensAction",
+          title: `Major upgrade available: ${versionInfo.latestMajor}`,
+          tooltip: `Upgrades ${dependency.name} from ${dependency.cleanVersion} to ${versionInfo.latestMajor}`,
           arguments: [
             {
               pkg: dependency.name,
-              newVersion: versionInfo.latestPatch,
-              packageJsonPath: packageJsonPath,
+              newVersion: versionInfo.latestMajor,
+              filePath: filePath,
+              ecosystem: "npm" as const,
             },
           ],
         });
+      }
+
+      // Minor upgrade
+      if (versionInfo.latestMinor) {
+        const latestMinor = semver.valid(versionInfo.latestMinor);
+        if (
+          latestMinor &&
+          semver.major(latestMinor) === currentMajor &&
+          semver.minor(latestMinor) > currentMinor
+        ) {
+          commands.push({
+            command: "deps-versions.codelensAction",
+            title: `Minor upgrade available: ${versionInfo.latestMinor}`,
+            tooltip: `Upgrades ${dependency.name} from ${dependency.cleanVersion} to ${versionInfo.latestMinor}`,
+            arguments: [
+              {
+                pkg: dependency.name,
+                newVersion: versionInfo.latestMinor,
+                filePath: filePath,
+                ecosystem: "npm" as const,
+              },
+            ],
+          });
+        }
+      }
+
+      // Patch upgrade
+      if (versionInfo.latestPatch) {
+        const latestPatch = semver.valid(versionInfo.latestPatch);
+        if (
+          latestPatch &&
+          semver.major(latestPatch) === currentMajor &&
+          semver.minor(latestPatch) === currentMinor &&
+          semver.patch(latestPatch) > currentPatch
+        ) {
+          commands.push({
+            command: "deps-versions.codelensAction",
+            title: `Patch upgrade available: ${versionInfo.latestPatch}`,
+            tooltip: `Upgrades ${dependency.name} from ${dependency.cleanVersion} to ${versionInfo.latestPatch}`,
+            arguments: [
+              {
+                pkg: dependency.name,
+                newVersion: versionInfo.latestPatch,
+                filePath: filePath,
+                ecosystem: "npm" as const,
+              },
+            ],
+          });
+        }
       }
     }
 
@@ -834,28 +1054,28 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     // Debounce updates - max every 200ms
     if (this.updateDebounceTimer) {
       this.log(
-        `[npm-deps-versions:scheduleCodeLensUpdate] Clearing existing debounce timer`
+        `[deps-versions:scheduleCodeLensUpdate] Clearing existing debounce timer`
       );
       clearTimeout(this.updateDebounceTimer);
     }
 
     this.log(
-      `[npm-deps-versions:scheduleCodeLensUpdate] Setting new debounce timer (200ms)`
+      `[deps-versions:scheduleCodeLensUpdate] Setting new debounce timer (200ms)`
     );
     this.updateDebounceTimer = setTimeout(() => {
       // Only fire if we're not actively loading
       const isLoading = this.loadingDocuments.get(documentUri);
       if (!isLoading) {
         this.log(
-          `[npm-deps-versions:scheduleCodeLensUpdate] Firing onDidChangeCodeLenses event`
+          `[deps-versions:scheduleCodeLensUpdate] Firing onDidChangeCodeLenses event`
         );
         this._onDidChangeCodeLenses.fire();
         this.log(
-          `[npm-deps-versions:scheduleCodeLensUpdate] onDidChangeCodeLenses event fired`
+          `[deps-versions:scheduleCodeLensUpdate] onDidChangeCodeLenses event fired`
         );
       } else {
         this.log(
-          `[npm-deps-versions:scheduleCodeLensUpdate] Skipping event fire - document is still loading`
+          `[deps-versions:scheduleCodeLensUpdate] Skipping event fire - document is still loading`
         );
       }
       this.updateDebounceTimer = undefined;
@@ -875,10 +1095,16 @@ export class CodelensProvider implements vscode.CodeLensProvider {
    * Optionally invalidates only specific packages
    */
   invalidateCache(documentUri: string, packageNames?: string[]): void {
+    // Invalidate for both ecosystems (cache keys are prefixed)
+    const npmUri = `npm:${documentUri}`;
+    const pythonUri = `python:${documentUri}`;
+    
     if (packageNames && packageNames.length > 0) {
-      this.cache.invalidateDependencies(documentUri, packageNames);
+      this.cache.invalidateDependencies(npmUri, packageNames);
+      this.cache.invalidateDependencies(pythonUri, packageNames);
     } else {
-      this.cache.invalidateDocument(documentUri);
+      this.cache.invalidateDocument(npmUri);
+      this.cache.invalidateDocument(pythonUri);
       // Clear completion state so next provideCodeLenses will reload
       this.completedLoads.delete(documentUri);
       this.loadingDocuments.delete(documentUri);
@@ -894,30 +1120,40 @@ export class CodelensProvider implements vscode.CodeLensProvider {
    */
   handleDocumentSave(document: vscode.TextDocument): void {
     const documentUri = document.uri.toString();
+    const isPython = document.fileName.endsWith("pyproject.toml");
+    const isNpm = document.fileName.endsWith("package.json");
 
-    // Parse package.json to extract current dependencies
-    let packageJson: any;
-    try {
-      packageJson = JSON.parse(document.getText());
-    } catch (error) {
-      // Invalid JSON - invalidate all as fallback
-      this.invalidateCache(documentUri);
+    if (!isPython && !isNpm) {
       return;
     }
 
-    const currentDependencies = this.extractDependencies(packageJson, document);
+    // Parse file to extract current dependencies
+    let currentDependencies: DependencyInfo[];
+    if (isPython) {
+      currentDependencies = PyprojectParser.extractDependencies(document);
+    } else {
+      let packageJson: any;
+      try {
+        packageJson = JSON.parse(document.getText());
+      } catch (error) {
+        // Invalid JSON - invalidate all as fallback
+        this.invalidateCache(documentUri);
+        return;
+      }
+      currentDependencies = this.extractDependencies(packageJson, document);
+    }
     const changedDeps = this.getChangedDependencies(documentUri, currentDependencies);
 
     if (changedDeps.length === 0) {
       // No changes, nothing to do
       this.log(
-        `[npm-deps-versions:handleDocumentSave] No dependency changes detected`
+        `[deps-versions:handleDocumentSave] No dependency changes detected`
       );
       return;
     }
 
     this.log(
-      `[npm-deps-versions:handleDocumentSave] Found ${changedDeps.length} changed dependencies: ${changedDeps.map(d => d.name).join(", ")}`
+      `[deps-versions:handleDocumentSave] Found ${changedDeps.length} changed dependencies: ${changedDeps.map(d => d.name).join(", ")}`
     );
 
     this.invalidateChangedDependencies(document, changedDeps);
@@ -937,9 +1173,12 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     }
 
     const packageNames = changedDeps.map((dep) => dep.name);
+    const isPython = document.fileName.endsWith("pyproject.toml");
+    const ecosystem = isPython ? "python" : "npm";
+    const ecosystemUri = `${ecosystem}:${documentUri}`;
     
-    // Invalidate cache for changed dependencies
-    this.cache.invalidateDependencies(documentUri, packageNames);
+    // Invalidate cache for changed dependencies (with ecosystem prefix)
+    this.cache.invalidateDependencies(ecosystemUri, packageNames);
 
     // Get current CodeLenses
     const existingCodeLenses = this.currentCodeLenses.get(documentUri);
@@ -950,15 +1189,19 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       return;
     }
 
-    // Parse package.json to get all dependencies to find correct indices
-    let packageJson: any;
-    try {
-      packageJson = JSON.parse(document.getText());
-    } catch (error) {
-      return;
+    // Parse file to get all dependencies to find correct indices
+    let allDependencies: DependencyInfo[];
+    if (isPython) {
+      allDependencies = PyprojectParser.extractDependencies(document);
+    } else {
+      let packageJson: any;
+      try {
+        packageJson = JSON.parse(document.getText());
+      } catch (error) {
+        return;
+      }
+      allDependencies = this.extractDependencies(packageJson, document);
     }
-
-    const allDependencies = this.extractDependencies(packageJson, document);
     
     // Create a map of dependency name to CodeLens index for quick lookup
     const depIndexMap = new Map<string, number>();
@@ -967,20 +1210,48 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     });
 
     // Create array of changed dependencies with their correct CodeLens indices
+    // Process in reverse index order to avoid index shifting issues
     const changedDepsWithIndices: Array<{ dep: DependencyInfo; index: number }> = [];
     for (const changedDep of changedDeps) {
       const codeLensIndex = depIndexMap.get(changedDep.name);
-      if (codeLensIndex !== undefined && existingCodeLenses[codeLensIndex]) {
-        // Update to loading state
-        existingCodeLenses[codeLensIndex] = new vscode.CodeLens(
-          new vscode.Range(changedDep.line, 0, changedDep.line, 0),
-          {
-            command: "",
-            title: "Loading version...",
-            arguments: [],
-          }
-        );
+      if (codeLensIndex !== undefined) {
         changedDepsWithIndices.push({ dep: changedDep, index: codeLensIndex });
+      }
+    }
+
+    // Sort by index in descending order to process from last to first
+    changedDepsWithIndices.sort((a, b) => b.index - a.index);
+
+    // Remove all existing CodeLenses for changed dependencies and insert loading state
+    for (const { dep: changedDep, index: codeLensIndex } of changedDepsWithIndices) {
+      // Remove all existing CodeLenses for this dependency
+      const removedCount = this.removeCodeLensesForDependency(
+        documentUri,
+        codeLensIndex,
+        changedDep.line
+      );
+      if (removedCount > 0) {
+        this.log(
+          `[deps-versions:invalidateChangedDependencies] Removed ${removedCount} CodeLens(es) for ${changedDep.name}`
+        );
+      }
+
+      // Get updated CodeLenses array after removal
+      const updatedCodeLenses = this.currentCodeLenses.get(documentUri);
+      if (updatedCodeLenses) {
+        // Insert loading CodeLens at the same index
+        updatedCodeLenses.splice(
+          codeLensIndex,
+          0,
+          new vscode.CodeLens(
+            new vscode.Range(changedDep.line, 0, changedDep.line, 0),
+            {
+              command: "",
+              title: "Loading version...",
+              arguments: [],
+            }
+          )
+        );
       }
     }
 
@@ -1007,13 +1278,13 @@ export class CodelensProvider implements vscode.CodeLensProvider {
     token: vscode.CancellationToken
   ): Promise<void> {
     const documentUri = document.uri.toString();
-    const config = vscode.workspace.getConfiguration("npm-deps-versions");
+    const isPython = document.fileName.endsWith("pyproject.toml");
+    const configNamespace = isPython ? "deps-versions.python" : "deps-versions.npm";
+    const config = vscode.workspace.getConfiguration(configNamespace);
     const versionGetMethod = config.get<string | undefined>("versionGetMethod");
-    const useNpmCli = versionGetMethod === "cli";
-    const packageJsonPath = document.uri.fsPath;
-    const packageJsonDir = packageJsonPath
-      ? path.dirname(packageJsonPath)
-      : undefined;
+    const useCli = versionGetMethod === "cli";
+    const filePath = document.uri.fsPath;
+    const fileDir = filePath ? path.dirname(filePath) : undefined;
 
     this.log(
       `[npm-deps-versions:loadVersionsAsyncPartial] Starting for ${
@@ -1023,16 +1294,24 @@ export class CodelensProvider implements vscode.CodeLensProvider {
 
     try {
       let outdatedPackages: Set<string> | undefined;
-      let npmCliAvailable = useNpmCli && packageJsonDir;
+      let npmCliAvailable = useCli && fileDir;
 
-      // If using npm CLI, first get outdated packages
+      // If using CLI, first get outdated packages
       if (npmCliAvailable) {
         try {
           const dependencyNames = dependenciesWithIndices.map((item) => item.dep.name);
-          outdatedPackages = await this.npmCliService.getOutdatedPackages(
-            packageJsonPath,
-            dependencyNames
-          );
+          if (isPython) {
+            outdatedPackages = await this.pythonCliService.getOutdatedPackages(
+              filePath,
+              dependencyNames,
+              config
+            );
+          } else {
+            outdatedPackages = await this.npmCliService.getOutdatedPackages(
+              filePath,
+              dependencyNames
+            );
+          }
         } catch (error) {
           npmCliAvailable = false;
           outdatedPackages = undefined;
@@ -1041,7 +1320,7 @@ export class CodelensProvider implements vscode.CodeLensProvider {
 
       // Load versions in parallel
       const versionPromises = dependenciesWithIndices.map(({ dep, index }) => {
-        // If using npm CLI and package is not outdated, skip it
+        // If using CLI and package is not outdated, skip it
         if (
           npmCliAvailable &&
           outdatedPackages &&
@@ -1051,7 +1330,7 @@ export class CodelensProvider implements vscode.CodeLensProvider {
             latestMajor: dep.cleanVersion,
             latestMinor: undefined,
             latestPatch: undefined,
-          });
+          }, isPython, filePath);
           return Promise.resolve();
         }
 
@@ -1062,8 +1341,10 @@ export class CodelensProvider implements vscode.CodeLensProvider {
           index,
           abortController.signal,
           !!npmCliAvailable,
-          packageJsonPath,
-          packageJsonDir
+          filePath,
+          fileDir,
+          isPython,
+          config
         );
       });
 
@@ -1076,13 +1357,13 @@ export class CodelensProvider implements vscode.CodeLensProvider {
       }
       this.previousDependencies.set(documentUri, existingState);
       this.log(
-        `[npm-deps-versions:loadVersionsAsyncPartial] Updated previousDependencies state for ${dependenciesWithIndices.length} changed dependencies`
+        `[deps-versions:loadVersionsAsyncPartial] Updated previousDependencies state for ${dependenciesWithIndices.length} changed dependencies`
       );
 
       this._onDidChangeCodeLenses.fire();
     } catch (error) {
       this.log(
-        `[npm-deps-versions:loadVersionsAsyncPartial] Error: ${error}`
+        `[deps-versions:loadVersionsAsyncPartial] Error: ${error}`
       );
     }
   }

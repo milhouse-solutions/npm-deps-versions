@@ -89,12 +89,21 @@ export class VersionCache {
     packageNames: string[]
   ): void {
     const keysToDelete: string[] = [];
+    const documentUriPrefix = `${documentUri}@`;
+    
     for (const key of this.cache.keys()) {
-      if (key.startsWith(`${documentUri}@`)) {
-        // Extract package name from cache key (format: documentUri@packageName@version)
-        const parts = key.split("@");
-        if (parts.length >= 2) {
-          const packageName = parts[1];
+      if (key.startsWith(documentUriPrefix)) {
+        // Extract package name and version from cache key
+        // Format: documentUri@packageName@version
+        // Note: packageName may contain @ (scoped packages like @types/node)
+        // So we need to split from the right: last part is version, rest after documentUri is packageName@version
+        const afterPrefix = key.substring(documentUriPrefix.length);
+        const lastAtIndex = afterPrefix.lastIndexOf("@");
+        
+        if (lastAtIndex > 0) {
+          // Extract package name (everything before the last @)
+          const packageName = afterPrefix.substring(0, lastAtIndex);
+          
           if (packageNames.includes(packageName)) {
             keysToDelete.push(key);
           }

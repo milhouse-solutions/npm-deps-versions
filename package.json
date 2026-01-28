@@ -1,8 +1,8 @@
 {
-  "name": "npm-deps-versions",
-  "displayName": "NPM Deps Versions",
-  "description": "This extension adds lense to package.json files dependencies and devDependencies section. For each dependecy, it will display the dependencyies current version from registry.npmjs.org",
-  "version": "1.0.5",
+  "name": "deps-versions",
+  "displayName": "Deps Versions",
+  "description": "This extension adds CodeLens to package.json and pyproject.toml files showing available dependency upgrades. Supports npm/pip/uv with configurable CLI or HTTP methods.",
+  "version": "1.0.6",
   "icon": "icon.png",
   "publisher": "milhouse-solutions",
   "repository": "https://github.com/milhouse-solutions/npm-deps-versions",
@@ -14,70 +14,96 @@
     "Other"
   ],
   "activationEvents": [
-    "workspaceContains:**/package.json"
+    "workspaceContains:**/package.json",
+    "workspaceContains:**/pyproject.toml"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
         "title": "Enable CodeLens",
-        "command": "npm-deps-versions.enableCodeLens",
-        "category": "NPM Deps Versions"
+        "command": "deps-versions.enableCodeLens",
+        "category": "Deps Versions"
       },
       {
         "title": "Disable Codelens",
-        "command": "npm-deps-versions.disableCodeLens",
-        "category": "NPM Deps Versions"
+        "command": "deps-versions.disableCodeLens",
+        "category": "Deps Versions"
       },
       {
         "title": "Refresh Cache",
-        "command": "npm-deps-versions.refreshCache",
-        "category": "NPM Deps Versions"
+        "command": "deps-versions.refreshCache",
+        "category": "Deps Versions"
       }
     ],
     "configuration": {
       "properties": {
-        "npm-deps-versions.enableCodeLens": {
+        "deps-versions.npm.enableCodeLens": {
           "type": "boolean",
           "default": true,
-          "description": "Show CodeLens for available dependency upgrades.",
+          "description": "Show CodeLens for available npm dependency upgrades.",
           "order": 1
         },
-        "npm-deps-versions.enableReleaseCandidateUpgrades": {
+        "deps-versions.npm.enableReleaseCandidateUpgrades": {
           "type": "boolean",
           "default": false,
-          "description": "Search for release candidate versions.",
+          "description": "Search for release candidate versions (npm).",
           "order": 2
         },
-        "npm-deps-versions.enableBetaUpgrades": {
+        "deps-versions.npm.enableBetaUpgrades": {
           "type": "boolean",
           "default": false,
-          "description": "Search for beta versions.",
+          "description": "Search for beta versions (npm).",
           "order": 3
         },
-        "npm-deps-versions.enableAlphaUpgrades": {
+        "deps-versions.npm.enableAlphaUpgrades": {
           "type": "boolean",
           "default": false,
-          "description": "Search for alpha versions.",
+          "description": "Search for alpha versions (npm).",
           "order": 4
         },
-        "npm-deps-versions.enableDevUpgrades": {
+        "deps-versions.npm.enableDevUpgrades": {
           "type": "boolean",
           "default": false,
-          "description": "Search for developer versions.",
+          "description": "Search for developer versions (npm).",
           "order": 5
         },
-        "npm-deps-versions.versionGetMethod": {
+        "deps-versions.npm.versionGetMethod": {
           "type": "string",
           "enum": ["cli", "http"],
-          "description": "Method to fetch package versions: 'cli' uses npm CLI, 'http' uses HTTP requests to npm registry. Leave unset to be prompted on first use.",
+          "description": "Method to fetch npm package versions: 'cli' uses npm CLI, 'http' uses HTTP requests to npm registry. Leave unset to be prompted on first use.",
           "order": 6
         },
-        "npm-deps-versions.httpTimeout": {
+        "deps-versions.npm.httpTimeout": {
           "type": "number",
           "default": 30000,
           "description": "Timeout in milliseconds for HTTP requests to npm registry (HTTP mode only). Default is 30000ms (30 seconds) to match npm CLI timeout.",
           "order": 7
+        },
+        "deps-versions.python.enableCodeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show CodeLens for available Python dependency upgrades.",
+          "order": 8
+        },
+        "deps-versions.python.versionGetMethod": {
+          "type": "string",
+          "enum": ["cli", "http"],
+          "description": "Method to fetch Python package versions: 'cli' uses pip/uv CLI, 'http' uses HTTP requests to PyPI. Leave unset to be prompted on first use.",
+          "order": 9
+        },
+        "deps-versions.python.pipTool": {
+          "type": "string",
+          "enum": ["auto", "pip", "uv"],
+          "default": "auto",
+          "description": "Python package manager to use: 'auto' detects uv.lock file or uv command, 'pip' forces pip, 'uv' forces uv.",
+          "order": 10
+        },
+        "deps-versions.python.httpTimeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "Timeout in milliseconds for HTTP requests to PyPI (HTTP mode only). Default is 30000ms (30 seconds).",
+          "order": 11
         }
       }
     }
@@ -91,7 +117,8 @@
     "test": "vscode-test"
   },
   "dependencies": {
-    "semver": "^7.7.3"
+    "semver": "^7.7.3",
+    "@iarna/toml": "^2.2.5"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
